@@ -145,3 +145,50 @@ bcon はデフォルトで libseat 対応。以下が可能:
 - GDM/SDDM ログインセッション
 
 同じバイナリが `sudo` でもユーザーセッションでも動作します。
+
+
+## Arch Linux ユーザー向け
+Debian/Ubuntu と比べていくつか違いがあります。
+
+1. パッケージマネージャー (公式リポジトリ用)
+
+Arch では apt の代わりに pacman を使います。
+```
+sudo apt install [package-name]
+```
+```
+sudo pacman -S [package-name]
+```
+
+2. AUR (Arch User Repository) と AUR ヘルパー
+
+bcon パッケージは AUR に登録されています (community-maintained by @kay-ws)。
+パッケージ取得には AUR ヘルパー (yay, paru 等) が必要です。
+```
+yay -S [AUR-package-name]       # sudo は付けない
+```
+
+AUR ヘルパーが未導入の場合、以下の手順で入手できます。
+(ここでは「yay」を例とします。)
+```bash
+sudo pacman -S --needed git base-devel
+git clone https://aur.archlinux.org/yay.git
+cd yay && makepkg -si
+```
+
+3. bcon のインストール
+
+以下を
+```
+curl -fsSL https://sanohiro.github.io/bcon/install.sh | sudo sh
+sudo apt install bcon
+```
+次で置き換えます。
+```
+yay -S bcon
+```
+
+4. ユーザーログインセッション
+
+セッションファイル (`bcon-session`, `bcon.desktop`) は AUR パッケージが最終配置先に直接インストールするため、手動コピーは不要です。
+
