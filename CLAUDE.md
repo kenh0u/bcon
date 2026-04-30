@@ -96,10 +96,11 @@ Think "Ghostty for the console" - bringing modern terminal features (True Color,
 - URL detection with Ctrl+Click
 
 ### Configuration
-- TOML-based configuration (`~/.config/bcon/config.toml`)
+- TOML-based configuration with layered XDG merge: built-in defaults → `/etc/bcon/config.toml` → `~/.config/bcon/config.toml` (tables merge recursively, scalars/arrays replace)
+- `BCON_CONFIG` env var bypasses the merge for single-file debugging
 - Configurable keybinds (multiple keys per action)
 - Preset support: `default`, `vim`, `emacs`, `japanese`/`jp`
-- Combinable presets: `--init-config=vim,jp`
+- `--init-config=[user|system|<path>,]preset[,preset...]` chooses the target explicitly; legacy `--init-config=vim,jp` still writes to `~/.config/bcon/config.toml`
 
 ## File Structure
 

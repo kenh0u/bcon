@@ -4,8 +4,66 @@
 
 ## 設定ファイルの場所
 
-- `/etc/bcon/config.toml` — システム設定 (systemd サービス用)
-- `~/.config/bcon/config.toml` — ユーザー設定
+bcon は設定を 3 レイヤーでマージして読み込みます (XDG 流):
+
+1. **組み込みデフォルト**: バイナリに埋め込まれた既定値 (常に存在)。
+2. `/etc/bcon/config.toml`: サイト共通設定。通常はパッケージマネージャ
+   がインストールします。組み込みデフォルトに上書き適用されます。
+3. `~/.config/bcon/config.toml`: ユーザー個別の上書き。サイト共通設定に
+   上書き適用されます。多くのユーザーが編集するのはこのレイヤーです。
+
+テーブルは再帰的にマージされ、スカラ・配列・`Option` フィールドは上位
+レイヤーで丸ごと置き換えられます (helix / mpv と同じセマンティクス)。
+ユーザーが書かなかったフィールドはサイト共通 → 組み込みデフォルトの順で
+透けて見えるので、部分的なユーザー設定でも問題ありません (推奨)。
+
+## 設定ファイルの生成: `--init-config`
+
+`--init-config` はオプションのカンマ区切り引数を取ります。最初のトークン
+が `system`、`user`、`/` または `~/` で始まるパスのいずれかであれば、
+それが書き込み先になります。残りのトークンはプリセット名として扱われます。
+
+### 書き込み先
+
+| 形式 | 書き込み先 |
+|---|---|
+| `bcon --init-config=system` | `/etc/bcon/config.toml` |
+| `bcon --init-config=user` | `~/.config/bcon/config.toml` |
+| `bcon --init-config=/tmp/x.toml` | `/tmp/x.toml` (読み込みは `BCON_CONFIG` 参照、後述) |
+| `bcon --init-config=~/foo.toml` | `$HOME/foo.toml` (tilde 展開、読み込みは `BCON_CONFIG` 参照、後述) |
+
+`system` トークン使用時は `/etc/bcon/` への書き込み権限が必要なので
+`sudo` で実行してください。
+
+### コマンド実行例
+
+```bash
+sudo bcon --init-config=system,default
+bcon --init-config=user,vim,jp
+```
+
+## 単一ファイルバイパス: `BCON_CONFIG`
+
+環境変数 `BCON_CONFIG` にパスを設定し、そのファイルが存在する場合、
+**そのファイルのみが読み込まれます** ─ `/etc/` と `~/.config/` の
+レイヤーはスキップされ、マージは行われません。
+
+主な用途は 2 つ:
+
+1. **任意パスで生成したアドホック設定の読み込み**。
+   `--init-config=/tmp/x.toml` や `--init-config=~/foo.toml` で生成
+   したファイルは XDG 標準パス外なので、通常起動時には読み込まれません。
+   `BCON_CONFIG` がそれら任意パス書き込みと実行時読み込みを橋渡しします。
+2. **デバッグ**。`BCON_CONFIG=/dev/null bcon` は何もファイルを読まず
+   組み込みデフォルトのみで起動するので、`/etc/bcon/` や `~/.config/bcon/`
+   を触らずに baseline 比較ができます。
+
+例:
+
+```bash
+bcon --init-config=~/foo.toml,vim       # ファイル生成
+BCON_CONFIG=~/foo.toml bcon              # そのファイルだけを読み込み起動
+```
 
 ## 利用可能なプリセット
 
@@ -15,16 +73,8 @@
 | `vim` | Vim ライクスクロール (Ctrl+Shift+U/D) |
 | `emacs` | Emacs ライクスクロール (Alt+Shift+V/N) |
 | `japanese` / `jp` | CJK フォント + IME 自動無効化 |
-| `system` | /etc/bcon/config.toml に出力 |
 
-設定ファイルの生成:
-
-```bash
-bcon --init-config=vim,jp           # ユーザー設定
-sudo bcon --init-config=system,vim  # システム設定
-```
-
-## 設定例
+## 設定ファイル例
 
 ```toml
 [font]
