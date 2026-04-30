@@ -902,25 +902,40 @@ impl Config {
         None
     }
 
-    /// Load configuration with priority:
-    /// 1. BCON_CONFIG environment variable
-    /// 2. ~/.config/bcon/config.toml (user config)
-    /// 3. /etc/bcon/config.toml (system config)
-    /// 4. Built-in defaults
+    /// Load configuration using the layered XDG model.
+    ///
+    /// Resolution order:
+    /// 1. `BCON_CONFIG` environment variable, if set and the file exists,
+    ///    is loaded as a single-file bypass (no merge with other layers).
+    ///    Intended for debugging and testing — the override is exclusive.
+    /// 2. Otherwise the layered merge applies: built-in defaults are
+    ///    overlaid first by `/etc/bcon/config.toml` (site default,
+    ///    typically installed by the package manager) and then by
+    ///    `~/.config/bcon/config.toml` (per-user override). Tables merge
+    ///    recursively; scalars and arrays are replaced wholesale by the
+    ///    later layer. See [`Config::load_layered_from_paths`] for the
+    ///    pure form used by tests.
     pub fn load() -> Self {
-        if let Some(path) = Self::config_path() {
-            match Self::load_from_file(path.to_string_lossy().as_ref()) {
-                Ok(config) => {
-                    info!("Loaded config: {}", path.display());
-                    return config;
+        if let Ok(p) = std::env::var("BCON_CONFIG") {
+            let path = std::path::Path::new(&p);
+            if path.exists() {
+                match Self::load_from_file(&p) {
+                    Ok(c) => {
+                        info!("BCON_CONFIG override (bypassing layered merge): {}", p);
+                        return c;
+                    }
+                    Err(e) => warn!("BCON_CONFIG load failed ({}): {}", p, e),
                 }
-                Err(e) => {
-                    warn!("Failed to load config {}: {}", path.display(), e);
-                }
+            } else {
+                warn!("BCON_CONFIG points to non-existent path: {}", p);
             }
         }
-        info!("Using built-in default config");
-        Self::default()
+
+        let user_path = dirs::config_dir().map(|d| d.join("bcon").join("config.toml"));
+        Self::load_layered_from_paths(
+            std::path::Path::new(Self::SYSTEM_CONFIG_PATH),
+            user_path.as_deref(),
+        )
     }
 
     /// Load configuration by merging up to three layers in priority order:
@@ -1771,6 +1786,46 @@ lcd_weights = [10, 20, 30, 40, 50]
         assert!(
             (cfg.font.size - 20.0).abs() < f32::EPSILON,
             "system layer must win when user layer is malformed, got {}",
+            cfg.font.size
+        );
+    }
+
+    #[test]
+    fn test_load_bcon_config_env_bypasses_layers() {
+        // BCON_CONFIG, when set and pointing to an existing file, must bypass
+        // the layered merge entirely and load that single file. Other layers
+        // (system /etc, user ~/.config) are deliberately ignored even if they
+        // exist. This is the debug/test override semantics.
+        //
+        // env::set_var/remove_var pollute the process; serialize against any
+        // future env-touching tests using a static Mutex. Save and restore the
+        // previous value so we do not leak test state into other tests or the
+        // surrounding cargo invocation.
+        use std::fs;
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let bcon_config = tmp.path().join("override.toml");
+        fs::write(&bcon_config, "[font]\nsize = 99\n").unwrap();
+
+        let prev = std::env::var_os("BCON_CONFIG");
+        std::env::set_var("BCON_CONFIG", &bcon_config);
+
+        let cfg = Config::load();
+
+        if let Some(p) = prev {
+            std::env::set_var("BCON_CONFIG", p);
+        } else {
+            std::env::remove_var("BCON_CONFIG");
+        }
+
+        // BCON_CONFIG file's font.size = 99 must win even though no system or
+        // user layer was set up; default for everything else stays builtin.
+        assert!(
+            (cfg.font.size - 99.0).abs() < f32::EPSILON,
+            "BCON_CONFIG must bypass layers and override font.size, got {}",
             cfg.font.size
         );
     }
