@@ -1012,6 +1012,20 @@ impl Config {
         })
     }
 
+    /// Serialize `Config::default()` to a TOML string suitable for installation
+    /// at `/etc/bcon/config.toml` by package distributors.
+    ///
+    /// Maintainers should use this output as the byte-identical content of
+    /// the package-shipped site-default config so that the runtime merge
+    /// floor (`Config::default()`) and the distributed template never drift.
+    /// CI in distribution repositories should assert
+    /// `Config::default_template()` round-trips through `toml::from_str`
+    /// back into the committed template file.
+    pub fn default_template() -> String {
+        toml::to_string_pretty(&Self::default())
+            .expect("Config::default must serialize")
+    }
+
     /// Load settings from specified path
     fn load_from_file(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -1828,5 +1842,26 @@ lcd_weights = [10, 20, 30, 40, 50]
             "BCON_CONFIG must bypass layers and override font.size, got {}",
             cfg.font.size
         );
+    }
+
+    #[test]
+    fn test_default_template_round_trips() {
+        // Config::default_template() must produce a TOML string that parses
+        // cleanly back into a Config equivalent to Config::default(). This
+        // is the upstream-side check that protects distributors against
+        // silent drift between the Default impl and any package-shipped
+        // /etc/bcon/config.toml template.
+        let rendered = Config::default_template();
+        let parsed: Config = toml::from_str(&rendered)
+            .expect("default_template output must round-trip through toml::from_str");
+        let default = Config::default();
+
+        // Spot-check representative leaf fields across multiple sections.
+        assert!((parsed.font.size - default.font.size).abs() < f32::EPSILON);
+        assert_eq!(
+            parsed.terminal.scrollback_lines,
+            default.terminal.scrollback_lines
+        );
+        assert_eq!(parsed.keybinds.copy, default.keybinds.copy);
     }
 }
