@@ -945,30 +945,56 @@ impl Config {
         user: Option<&std::path::Path>,
     ) -> Self {
         let default_cfg = Self::default();
+        // Config::default() is TOML-serializable by construction; failure here
+        // would be a programming error in a Default impl, not a runtime input
+        // problem, so we panic instead of warn-and-fall-back.
         let mut merged: toml::Value = toml::Value::try_from(&default_cfg)
             .expect("Config::default must serialize cleanly");
 
         if system.exists() {
-            if let Ok(v) = parse_layer(system) {
-                info!("Loaded system layer: {}", system.display());
-                merge_value(&mut merged, v);
+            match parse_layer(system) {
+                Ok(v) => {
+                    info!("Loaded system layer: {}", system.display());
+                    merge_value(&mut merged, v);
+                }
+                Err(e) => warn!(
+                    "Skipping malformed system layer {}: {}",
+                    system.display(),
+                    e
+                ),
             }
-            // TODO(cycle 4): warn on Err (malformed system layer).
+        } else {
+            warn!(
+                "System config not found at {}. Running with builtin defaults only. \
+                 If you installed bcon via a package manager, please reinstall. \
+                 Otherwise create it with: sudo bcon --init-config=system",
+                system.display()
+            );
         }
-        // TODO(cycle 4): warn when system layer is missing.
 
         if let Some(user) = user {
             if user.exists() {
-                if let Ok(v) = parse_layer(user) {
-                    info!("Loaded user layer: {}", user.display());
-                    merge_value(&mut merged, v);
+                match parse_layer(user) {
+                    Ok(v) => {
+                        info!("Loaded user layer: {}", user.display());
+                        merge_value(&mut merged, v);
+                    }
+                    Err(e) => warn!(
+                        "Skipping malformed user layer {}: {}",
+                        user.display(),
+                        e
+                    ),
                 }
-                // TODO(cycle 4): warn on Err (malformed user layer).
             }
         }
 
-        // TODO(cycle 4): warn and fall back to default_cfg on coerce failure.
-        merged.try_into::<Config>().expect("merged config must coerce back into Config")
+        merged.try_into::<Config>().unwrap_or_else(|e| {
+            warn!(
+                "Merged config failed to coerce ({}); falling back to builtin.",
+                e
+            );
+            default_cfg
+        })
     }
 
     /// Load settings from specified path
@@ -1695,6 +1721,57 @@ lcd_weights = [10, 20, 30, 40, 50]
         assert_eq!(
             cfg.terminal.scrollback_lines, default_terminal.scrollback_lines,
             "fields absent from both layers must fall back to builtin default"
+        );
+    }
+
+    #[test]
+    fn test_load_no_system_layer() {
+        // When the system layer file does not exist (and no user layer is
+        // provided), the loader must degrade gracefully to builtin defaults.
+        // No panic, no error return — just `Config::default()` equivalents.
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("nonexistent-etc-bcon-config.toml");
+        assert!(!system_path.exists(), "precondition: system path must not exist");
+
+        let cfg = Config::load_layered_from_paths(&system_path, None);
+
+        // Representative leaf fields should match Config::default() values.
+        let default_font = FontConfig::default();
+        assert!(
+            (cfg.font.size - default_font.size).abs() < f32::EPSILON,
+            "font.size must fall back to builtin default, got {}",
+            cfg.font.size
+        );
+
+        let default_terminal = TerminalConfig::default();
+        assert_eq!(
+            cfg.terminal.scrollback_lines, default_terminal.scrollback_lines,
+            "terminal.scrollback_lines must fall back to builtin default"
+        );
+    }
+
+    #[test]
+    fn test_load_malformed_user_layer() {
+        // A malformed user layer must be skipped (with a warn log) so that the
+        // effective config remains builtin + system. The system value must win
+        // on the overlapping key, and the call must not panic.
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("system.toml");
+        let user_path = tmp.path().join("user.toml");
+
+        fs::write(&system_path, "[font]\nsize = 20\n").unwrap();
+        // Invalid TOML: bare punctuation cannot be parsed as a key/value or table.
+        fs::write(&user_path, "!@#\n").unwrap();
+
+        let cfg = Config::load_layered_from_paths(&system_path, Some(&user_path));
+
+        // System layer's font.size must win because the user layer was skipped.
+        assert!(
+            (cfg.font.size - 20.0).abs() < f32::EPSILON,
+            "system layer must win when user layer is malformed, got {}",
+            cfg.font.size
         );
     }
 }
