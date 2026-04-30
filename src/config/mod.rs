@@ -855,6 +855,19 @@ fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+/// Read a TOML file from disk and parse it into a generic `toml::Value`.
+///
+/// Returned as `toml::Value` (not `Config`) so the caller can feed it into
+/// [`merge_value`] before coercing the merged tree back into [`Config`] —
+/// this preserves field-level missing-vs-present semantics across layers.
+fn parse_layer(path: &std::path::Path) -> Result<toml::Value> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config layer: {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config layer: {}", path.display()))?;
+    Ok(value)
+}
+
 impl Config {
     /// System-wide config path
     const SYSTEM_CONFIG_PATH: &'static str = "/etc/bcon/config.toml";
@@ -908,6 +921,54 @@ impl Config {
         }
         info!("Using built-in default config");
         Self::default()
+    }
+
+    /// Load configuration by merging up to three layers in priority order:
+    ///
+    /// 1. Builtin defaults from [`Config::default`] (always present).
+    /// 2. System layer at `system` path (e.g. `/etc/bcon/config.toml`).
+    /// 3. User layer at `user` path (e.g. `~/.config/bcon/config.toml`).
+    ///
+    /// Each successive layer overlays its keys on top of the merged tree using
+    /// [`merge_value`]: tables merge recursively, while scalars, arrays, and
+    /// `Option` fields replace wholesale. Missing files are silently skipped
+    /// in this happy-path form; richer diagnostics (warn-on-missing system,
+    /// warn-on-malformed) are layered on in a later cycle.
+    ///
+    /// This function takes explicit paths instead of resolving them itself so
+    /// it can be unit-tested with `tempfile::tempdir()`. The production
+    /// dispatcher that wires `BCON_CONFIG` and XDG paths into this entry
+    /// point will be added in a follow-up cycle; until then, callers like
+    /// [`Config::load`] still use the first-found-exclusive path.
+    pub(crate) fn load_layered_from_paths(
+        system: &std::path::Path,
+        user: Option<&std::path::Path>,
+    ) -> Self {
+        let default_cfg = Self::default();
+        let mut merged: toml::Value = toml::Value::try_from(&default_cfg)
+            .expect("Config::default must serialize cleanly");
+
+        if system.exists() {
+            if let Ok(v) = parse_layer(system) {
+                info!("Loaded system layer: {}", system.display());
+                merge_value(&mut merged, v);
+            }
+            // TODO(cycle 4): warn on Err (malformed system layer).
+        }
+        // TODO(cycle 4): warn when system layer is missing.
+
+        if let Some(user) = user {
+            if user.exists() {
+                if let Ok(v) = parse_layer(user) {
+                    info!("Loaded user layer: {}", user.display());
+                    merge_value(&mut merged, v);
+                }
+                // TODO(cycle 4): warn on Err (malformed user layer).
+            }
+        }
+
+        // TODO(cycle 4): warn and fall back to default_cfg on coerce failure.
+        merged.try_into::<Config>().expect("merged config must coerce back into Config")
     }
 
     /// Load settings from specified path
@@ -1604,5 +1665,36 @@ lcd_weights = [10, 20, 30, 40, 50]
         assert_eq!(weights.len(), 5);
         assert_eq!(weights[0].as_integer(), Some(10));
         assert_eq!(weights[4].as_integer(), Some(50));
+    }
+
+    #[test]
+    fn test_load_three_layer_merge() {
+        // Three-layer merge: builtin defaults <- system layer <- user layer.
+        // The user layer must win on overlapping keys, while keys absent from
+        // both files must fall back to Config::default() values transparently.
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("etc-bcon-config.toml");
+        let user_path = tmp.path().join("user-bcon-config.toml");
+
+        fs::write(&system_path, "[font]\nsize = 20\n").unwrap();
+        fs::write(&user_path, "[font]\nsize = 24\n").unwrap();
+
+        let cfg = Config::load_layered_from_paths(&system_path, Some(&user_path));
+
+        // User layer wins for the overlapping key.
+        assert!(
+            (cfg.font.size - 24.0).abs() < f32::EPSILON,
+            "user layer must win on font.size, got {}",
+            cfg.font.size
+        );
+
+        // Builtin transparency: an unrelated field equals Default::default().
+        let default_terminal = TerminalConfig::default();
+        assert_eq!(
+            cfg.terminal.scrollback_lines, default_terminal.scrollback_lines,
+            "fields absent from both layers must fall back to builtin default"
+        );
     }
 }
