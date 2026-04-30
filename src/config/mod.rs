@@ -830,6 +830,31 @@ struct PaneTabKeybinds {
     prev_tab: Vec<String>,
 }
 
+/// Merge `overlay` into `base` as a TOML value tree.
+///
+/// Tables are merged recursively, so that keys present only in `base` are
+/// preserved while keys present in `overlay` override (or add to) `base`.
+/// Any non-table slot — scalars, arrays, and missing-vs-present options —
+/// is replaced wholesale by the overlay value (no array append, no scalar mix).
+fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
+    use toml::Value;
+    match (base, overlay) {
+        (Value::Table(b), Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(existing) => merge_value(existing, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, overlay_val) => {
+            *slot = overlay_val;
+        }
+    }
+}
+
 impl Config {
     /// System-wide config path
     const SYSTEM_CONFIG_PATH: &'static str = "/etc/bcon/config.toml";
@@ -1512,5 +1537,72 @@ mod tests {
         assert!(kb.ctrl);
         assert!(kb.shift);
         assert_eq!(kb.key, "c");
+    }
+
+    #[test]
+    fn test_merge_recursive_table() {
+        // Tables are merged recursively: overlay's nested fields override base's
+        // matching fields, while sibling keys not present in overlay are preserved.
+        let mut base: toml::Value = toml::from_str(
+            r#"
+[font]
+size = 14
+
+[keybinds]
+copy = "x"
+"#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[font]
+size = 18
+"#,
+        )
+        .unwrap();
+
+        merge_value(&mut base, overlay);
+
+        let font = base.get("font").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(font.get("size").and_then(|v| v.as_integer()), Some(18));
+
+        let keybinds = base.get("keybinds").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            keybinds.get("copy").and_then(|v| v.as_str()),
+            Some("x"),
+            "sibling key absent in overlay must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_merge_array_replaces() {
+        // Arrays replace wholesale (no append/dedup). Keys missing in base
+        // are inserted from overlay.
+        let mut base: toml::Value = toml::from_str(
+            r#"
+items = ["a", "b"]
+"#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+items = ["foo"]
+lcd_weights = [10, 20, 30, 40, 50]
+"#,
+        )
+        .unwrap();
+
+        merge_value(&mut base, overlay);
+
+        let items = base.get("items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 1, "array must be replaced, not appended");
+        assert_eq!(items[0].as_str(), Some("foo"));
+
+        let weights = base.get("lcd_weights").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(weights.len(), 5);
+        assert_eq!(weights[0].as_integer(), Some(10));
+        assert_eq!(weights[4].as_integer(), Some(50));
     }
 }
