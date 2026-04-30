@@ -4,7 +4,7 @@ English | **[Japanese](configuration.ja.md)**
 
 ## Config File Locations
 
-bcon loads configuration in three layers (XDG-style merge):
+bcon loads configuration across multiple layers (XDG-style merge):
 
 1. **Built-in defaults** compiled into the binary (always present).
 2. `/etc/bcon/config.toml` — site default, typically installed by the

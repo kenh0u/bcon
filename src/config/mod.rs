@@ -998,7 +998,7 @@ impl Config {
         )
     }
 
-    /// Load configuration by merging up to three layers in priority order:
+    /// Load configuration by merging multiple layers in priority order:
     ///
     /// 1. Builtin defaults from [`Config::default`] (always present).
     /// 2. System layer at `system` path (e.g. `/etc/bcon/config.toml`).
@@ -1782,8 +1782,8 @@ lcd_weights = [10, 20, 30, 40, 50]
     }
 
     #[test]
-    fn test_load_three_layer_merge() {
-        // Three-layer merge: builtin defaults <- system layer <- user layer.
+    fn test_load_multi_layer_merge() {
+        // Multi-layer merge: builtin defaults <- system layer <- user layer.
         // The user layer must win on overlapping keys, while keys absent from
         // both files must fall back to Config::default() values transparently.
         use std::fs;
