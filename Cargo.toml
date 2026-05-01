@@ -80,7 +80,9 @@ udev = "0.8"
 default = ["seatd"]
 seatd = ["libseat"]
 
-# [dev-dependencies]
+[dev-dependencies]
+tempfile = "3"
+
 # criterion = "0.5"
 
 # [[bench]]
