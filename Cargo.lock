@@ -217,6 +217,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "smol_str",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

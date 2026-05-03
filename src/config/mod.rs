@@ -830,6 +830,44 @@ struct PaneTabKeybinds {
     prev_tab: Vec<String>,
 }
 
+/// Merge `overlay` into `base` as a TOML value tree.
+///
+/// Tables are merged recursively, so that keys present only in `base` are
+/// preserved while keys present in `overlay` override (or add to) `base`.
+/// Any non-table slot — scalars, arrays, and missing-vs-present options —
+/// is replaced wholesale by the overlay value (no array append, no scalar mix).
+fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
+    use toml::Value;
+    match (base, overlay) {
+        (Value::Table(b), Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(existing) => merge_value(existing, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, overlay_val) => {
+            *slot = overlay_val;
+        }
+    }
+}
+
+/// Read a TOML file from disk and parse it into a generic `toml::Value`.
+///
+/// Returned as `toml::Value` (not `Config`) so the caller can feed it into
+/// [`merge_value`] before coercing the merged tree back into [`Config`] —
+/// this preserves field-level missing-vs-present semantics across layers.
+fn parse_layer(path: &std::path::Path) -> Result<toml::Value> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config layer: {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config layer: {}", path.display()))?;
+    Ok(value)
+}
+
 impl Config {
     /// System-wide config path
     const SYSTEM_CONFIG_PATH: &'static str = "/etc/bcon/config.toml";
@@ -864,25 +902,128 @@ impl Config {
         None
     }
 
-    /// Load configuration with priority:
-    /// 1. BCON_CONFIG environment variable
-    /// 2. ~/.config/bcon/config.toml (user config)
-    /// 3. /etc/bcon/config.toml (system config)
-    /// 4. Built-in defaults
+    /// Load configuration using the layered XDG model.
+    ///
+    /// Resolution order:
+    /// 1. `BCON_CONFIG` environment variable, if set and the file exists,
+    ///    is loaded as a single-file bypass (no merge with other layers).
+    ///    Intended for debugging and testing — the override is exclusive.
+    /// 2. Otherwise the layered merge applies: built-in defaults are
+    ///    overlaid first by `/etc/bcon/config.toml` (site default,
+    ///    typically installed by the package manager) and then by
+    ///    `~/.config/bcon/config.toml` (per-user override). Tables merge
+    ///    recursively; scalars and arrays are replaced wholesale by the
+    ///    later layer. See [`Config::load_layered_from_paths`] for the
+    ///    pure form used by tests.
     pub fn load() -> Self {
-        if let Some(path) = Self::config_path() {
-            match Self::load_from_file(path.to_string_lossy().as_ref()) {
-                Ok(config) => {
-                    info!("Loaded config: {}", path.display());
-                    return config;
+        if let Ok(p) = std::env::var("BCON_CONFIG") {
+            let path = std::path::Path::new(&p);
+            if path.exists() {
+                match Self::load_from_file(&p) {
+                    Ok(c) => {
+                        info!("BCON_CONFIG override (bypassing layered merge): {}", p);
+                        return c;
+                    }
+                    Err(e) => warn!("BCON_CONFIG load failed ({}): {}", p, e),
                 }
-                Err(e) => {
-                    warn!("Failed to load config {}: {}", path.display(), e);
+            } else {
+                warn!("BCON_CONFIG points to non-existent path: {}", p);
+            }
+        }
+
+        let user_path = dirs::config_dir().map(|d| d.join("bcon").join("config.toml"));
+        Self::load_layered_from_paths(
+            std::path::Path::new(Self::SYSTEM_CONFIG_PATH),
+            user_path.as_deref(),
+        )
+    }
+
+    /// Load configuration by merging up to three layers in priority order:
+    ///
+    /// 1. Builtin defaults from [`Config::default`] (always present).
+    /// 2. System layer at `system` path (e.g. `/etc/bcon/config.toml`).
+    /// 3. User layer at `user` path (e.g. `~/.config/bcon/config.toml`).
+    ///
+    /// Each successive layer overlays its keys on top of the merged tree using
+    /// [`merge_value`]: tables merge recursively, while scalars, arrays, and
+    /// `Option` fields replace wholesale. Missing files are silently skipped
+    /// in this happy-path form; richer diagnostics (warn-on-missing system,
+    /// warn-on-malformed) are layered on in a later cycle.
+    ///
+    /// This function takes explicit paths instead of resolving them itself so
+    /// it can be unit-tested with `tempfile::tempdir()`. The production
+    /// dispatcher that wires `BCON_CONFIG` and XDG paths into this entry
+    /// point will be added in a follow-up cycle; until then, callers like
+    /// [`Config::load`] still use the first-found-exclusive path.
+    pub(crate) fn load_layered_from_paths(
+        system: &std::path::Path,
+        user: Option<&std::path::Path>,
+    ) -> Self {
+        let default_cfg = Self::default();
+        // Config::default() is TOML-serializable by construction; failure here
+        // would be a programming error in a Default impl, not a runtime input
+        // problem, so we panic instead of warn-and-fall-back.
+        let mut merged: toml::Value = toml::Value::try_from(&default_cfg)
+            .expect("Config::default must serialize cleanly");
+
+        if system.exists() {
+            match parse_layer(system) {
+                Ok(v) => {
+                    info!("Loaded system layer: {}", system.display());
+                    merge_value(&mut merged, v);
+                }
+                Err(e) => warn!(
+                    "Skipping malformed system layer {}: {}",
+                    system.display(),
+                    e
+                ),
+            }
+        } else {
+            warn!(
+                "System config not found at {}. Running with builtin defaults only. \
+                 If you installed bcon via a package manager, please reinstall. \
+                 Otherwise create it with: sudo bcon --init-config=system",
+                system.display()
+            );
+        }
+
+        if let Some(user) = user {
+            if user.exists() {
+                match parse_layer(user) {
+                    Ok(v) => {
+                        info!("Loaded user layer: {}", user.display());
+                        merge_value(&mut merged, v);
+                    }
+                    Err(e) => warn!(
+                        "Skipping malformed user layer {}: {}",
+                        user.display(),
+                        e
+                    ),
                 }
             }
         }
-        info!("Using built-in default config");
-        Self::default()
+
+        merged.try_into::<Config>().unwrap_or_else(|e| {
+            warn!(
+                "Merged config failed to coerce ({}); falling back to builtin.",
+                e
+            );
+            default_cfg
+        })
+    }
+
+    /// Serialize `Config::default()` to a TOML string suitable for installation
+    /// at `/etc/bcon/config.toml` by package distributors.
+    ///
+    /// Maintainers should use this output as the byte-identical content of
+    /// the package-shipped site-default config so that the runtime merge
+    /// floor (`Config::default()`) and the distributed template never drift.
+    /// CI in distribution repositories should assert
+    /// `Config::default_template()` round-trips through `toml::from_str`
+    /// back into the committed template file.
+    pub fn default_template() -> String {
+        toml::to_string_pretty(&Self::default())
+            .expect("Config::default must serialize")
     }
 
     /// Load settings from specified path
@@ -1512,5 +1653,215 @@ mod tests {
         assert!(kb.ctrl);
         assert!(kb.shift);
         assert_eq!(kb.key, "c");
+    }
+
+    #[test]
+    fn test_merge_recursive_table() {
+        // Tables are merged recursively: overlay's nested fields override base's
+        // matching fields, while sibling keys not present in overlay are preserved.
+        let mut base: toml::Value = toml::from_str(
+            r#"
+[font]
+size = 14
+
+[keybinds]
+copy = "x"
+"#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[font]
+size = 18
+"#,
+        )
+        .unwrap();
+
+        merge_value(&mut base, overlay);
+
+        let font = base.get("font").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(font.get("size").and_then(|v| v.as_integer()), Some(18));
+
+        let keybinds = base.get("keybinds").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            keybinds.get("copy").and_then(|v| v.as_str()),
+            Some("x"),
+            "sibling key absent in overlay must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_merge_array_replaces() {
+        // Arrays replace wholesale (no append/dedup). Keys missing in base
+        // are inserted from overlay.
+        let mut base: toml::Value = toml::from_str(
+            r#"
+items = ["a", "b"]
+"#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+items = ["foo"]
+lcd_weights = [10, 20, 30, 40, 50]
+"#,
+        )
+        .unwrap();
+
+        merge_value(&mut base, overlay);
+
+        let items = base.get("items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 1, "array must be replaced, not appended");
+        assert_eq!(items[0].as_str(), Some("foo"));
+
+        let weights = base.get("lcd_weights").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(weights.len(), 5);
+        assert_eq!(weights[0].as_integer(), Some(10));
+        assert_eq!(weights[4].as_integer(), Some(50));
+    }
+
+    #[test]
+    fn test_load_three_layer_merge() {
+        // Three-layer merge: builtin defaults <- system layer <- user layer.
+        // The user layer must win on overlapping keys, while keys absent from
+        // both files must fall back to Config::default() values transparently.
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("etc-bcon-config.toml");
+        let user_path = tmp.path().join("user-bcon-config.toml");
+
+        fs::write(&system_path, "[font]\nsize = 20\n").unwrap();
+        fs::write(&user_path, "[font]\nsize = 24\n").unwrap();
+
+        let cfg = Config::load_layered_from_paths(&system_path, Some(&user_path));
+
+        // User layer wins for the overlapping key.
+        assert!(
+            (cfg.font.size - 24.0).abs() < f32::EPSILON,
+            "user layer must win on font.size, got {}",
+            cfg.font.size
+        );
+
+        // Builtin transparency: an unrelated field equals Default::default().
+        let default_terminal = TerminalConfig::default();
+        assert_eq!(
+            cfg.terminal.scrollback_lines, default_terminal.scrollback_lines,
+            "fields absent from both layers must fall back to builtin default"
+        );
+    }
+
+    #[test]
+    fn test_load_no_system_layer() {
+        // When the system layer file does not exist (and no user layer is
+        // provided), the loader must degrade gracefully to builtin defaults.
+        // No panic, no error return — just `Config::default()` equivalents.
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("nonexistent-etc-bcon-config.toml");
+        assert!(!system_path.exists(), "precondition: system path must not exist");
+
+        let cfg = Config::load_layered_from_paths(&system_path, None);
+
+        // Representative leaf fields should match Config::default() values.
+        let default_font = FontConfig::default();
+        assert!(
+            (cfg.font.size - default_font.size).abs() < f32::EPSILON,
+            "font.size must fall back to builtin default, got {}",
+            cfg.font.size
+        );
+
+        let default_terminal = TerminalConfig::default();
+        assert_eq!(
+            cfg.terminal.scrollback_lines, default_terminal.scrollback_lines,
+            "terminal.scrollback_lines must fall back to builtin default"
+        );
+    }
+
+    #[test]
+    fn test_load_malformed_user_layer() {
+        // A malformed user layer must be skipped (with a warn log) so that the
+        // effective config remains builtin + system. The system value must win
+        // on the overlapping key, and the call must not panic.
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let system_path = tmp.path().join("system.toml");
+        let user_path = tmp.path().join("user.toml");
+
+        fs::write(&system_path, "[font]\nsize = 20\n").unwrap();
+        // Invalid TOML: bare punctuation cannot be parsed as a key/value or table.
+        fs::write(&user_path, "!@#\n").unwrap();
+
+        let cfg = Config::load_layered_from_paths(&system_path, Some(&user_path));
+
+        // System layer's font.size must win because the user layer was skipped.
+        assert!(
+            (cfg.font.size - 20.0).abs() < f32::EPSILON,
+            "system layer must win when user layer is malformed, got {}",
+            cfg.font.size
+        );
+    }
+
+    #[test]
+    fn test_load_bcon_config_env_bypasses_layers() {
+        // BCON_CONFIG, when set and pointing to an existing file, must bypass
+        // the layered merge entirely and load that single file. Other layers
+        // (system /etc, user ~/.config) are deliberately ignored even if they
+        // exist. This is the debug/test override semantics.
+        //
+        // env::set_var/remove_var pollute the process; serialize against any
+        // future env-touching tests using a static Mutex. Save and restore the
+        // previous value so we do not leak test state into other tests or the
+        // surrounding cargo invocation.
+        use std::fs;
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let bcon_config = tmp.path().join("override.toml");
+        fs::write(&bcon_config, "[font]\nsize = 99\n").unwrap();
+
+        let prev = std::env::var_os("BCON_CONFIG");
+        std::env::set_var("BCON_CONFIG", &bcon_config);
+
+        let cfg = Config::load();
+
+        if let Some(p) = prev {
+            std::env::set_var("BCON_CONFIG", p);
+        } else {
+            std::env::remove_var("BCON_CONFIG");
+        }
+
+        // BCON_CONFIG file's font.size = 99 must win even though no system or
+        // user layer was set up; default for everything else stays builtin.
+        assert!(
+            (cfg.font.size - 99.0).abs() < f32::EPSILON,
+            "BCON_CONFIG must bypass layers and override font.size, got {}",
+            cfg.font.size
+        );
+    }
+
+    #[test]
+    fn test_default_template_round_trips() {
+        // Config::default_template() must produce a TOML string that parses
+        // cleanly back into a Config equivalent to Config::default(). This
+        // is the upstream-side check that protects distributors against
+        // silent drift between the Default impl and any package-shipped
+        // /etc/bcon/config.toml template.
+        let rendered = Config::default_template();
+        let parsed: Config = toml::from_str(&rendered)
+            .expect("default_template output must round-trip through toml::from_str");
+        let default = Config::default();
+
+        // Spot-check representative leaf fields across multiple sections.
+        assert!((parsed.font.size - default.font.size).abs() < f32::EPSILON);
+        assert_eq!(
+            parsed.terminal.scrollback_lines,
+            default.terminal.scrollback_lines
+        );
+        assert_eq!(parsed.keybinds.copy, default.keybinds.copy);
     }
 }
