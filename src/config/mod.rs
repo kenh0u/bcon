@@ -868,6 +868,66 @@ fn parse_layer(path: &std::path::Path) -> Result<toml::Value> {
     Ok(value)
 }
 
+/// Where `Config::write_config_with_preset` should write the generated file.
+///
+/// Decoupled from the preset list (`vim`/`emacs`/`jp`) so that the caller
+/// must declare the destination explicitly and cannot accidentally route a
+/// `sudo bcon --init-config=vim` invocation to `/root/.config/bcon/`. The
+/// previous string-based dispatch silently routed by `dirs::config_dir()`
+/// of the calling user, which produced the root-shadow trap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// User config: `dirs::config_dir().join("bcon/config.toml")`.
+    User,
+    /// System config: `/etc/bcon/config.toml`.
+    System,
+    /// An explicit absolute path (debug / test / unusual deployments).
+    Path(std::path::PathBuf),
+}
+
+/// Expand a leading `~/` to the current user's home directory.
+///
+/// Anything else (including bare `~` without a slash) is returned as-is.
+fn expand_tilde(s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(s)
+}
+
+/// Parse the value of `--init-config[=ARG]` into a `(target, presets)` pair.
+///
+/// `arg` is the raw text after `=` (or the empty string for the bare
+/// `--init-config` form). The first comma-separated token is interpreted
+/// as a destination target if and only if it is exactly `"system"`,
+/// exactly `"user"`, or starts with `/` (absolute path) or `~/` (home
+/// expansion). All remaining tokens are treated as preset names
+/// (`default`, `vim`, `emacs`, `japanese`/`jp`). When the first token is
+/// not a target token, the destination defaults to `User` so that the
+/// legacy form `--init-config=vim,jp` keeps writing to
+/// `~/.config/bcon/config.toml`.
+pub fn parse_init_config_arg(arg: &str) -> (WriteTarget, Vec<String>) {
+    let tokens: Vec<&str> = arg
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let (target, preset_tokens): (WriteTarget, &[&str]) = match tokens.first() {
+        Some(&"system") => (WriteTarget::System, &tokens[1..]),
+        Some(&"user") => (WriteTarget::User, &tokens[1..]),
+        Some(t) if t.starts_with('/') || t.starts_with("~/") => {
+            (WriteTarget::Path(expand_tilde(t)), &tokens[1..])
+        }
+        _ => (WriteTarget::User, &tokens[..]),
+    };
+
+    let presets = preset_tokens.iter().map(|s| s.to_string()).collect();
+    (target, presets)
+}
+
 impl Config {
     /// System-wide config path
     const SYSTEM_CONFIG_PATH: &'static str = "/etc/bcon/config.toml";
@@ -938,7 +998,7 @@ impl Config {
         )
     }
 
-    /// Load configuration by merging up to three layers in priority order:
+    /// Load configuration by merging multiple layers in priority order:
     ///
     /// 1. Builtin defaults from [`Config::default`] (always present).
     /// 2. System layer at `system` path (e.g. `/etc/bcon/config.toml`).
@@ -1035,36 +1095,43 @@ impl Config {
         Ok(config)
     }
 
-    /// Write config to file (for template generation)
+    /// Write a config template to disk for the given target and preset list.
     ///
-    /// preset: can specify multiple comma-separated
-    /// Examples: "default", "emacs,japanese", "vim,jp"
-    ///
-    /// Special presets:
-    /// - "system" - Write to /etc/bcon/config.toml instead of user config
-    pub fn write_config_with_preset(preset: &str) -> Result<PathBuf> {
-        // Process multiple comma-separated presets
-        let presets: Vec<&str> = preset.split(',').map(|s| s.trim()).collect();
-
-        // Check if writing to system config
-        let use_system_path = presets.contains(&"system");
-
-        let config_path = if use_system_path {
-            let system_dir = std::path::Path::new("/etc/bcon");
-            std::fs::create_dir_all(system_dir)?;
-            system_dir.join("config.toml")
-        } else {
-            let config_dir =
-                dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Config directory not found"))?;
-            let bcon_dir = config_dir.join("bcon");
-            std::fs::create_dir_all(&bcon_dir)?;
-            bcon_dir.join("config.toml")
+    /// `target` decides where the file is written (`User` =
+    /// `~/.config/bcon/config.toml`, `System` = `/etc/bcon/config.toml`,
+    /// or an explicit `Path`). `presets` are the keybind/font preset
+    /// names (`default`, `vim`, `emacs`, `japanese`/`jp`). The target is
+    /// no longer mixed into the preset list; callers obtain a parsed
+    /// `WriteTarget` via `parse_init_config_arg`.
+    pub fn write_config_with_preset(
+        target: &WriteTarget,
+        presets: &[&str],
+    ) -> Result<PathBuf> {
+        let config_path = match target {
+            WriteTarget::System => {
+                let system_dir = std::path::Path::new("/etc/bcon");
+                std::fs::create_dir_all(system_dir)?;
+                system_dir.join("config.toml")
+            }
+            WriteTarget::User => {
+                let config_dir = dirs::config_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Config directory not found"))?;
+                let bcon_dir = config_dir.join("bcon");
+                std::fs::create_dir_all(&bcon_dir)?;
+                bcon_dir.join("config.toml")
+            }
+            WriteTarget::Path(p) => {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                p.clone()
+            }
         };
 
         let mut keybinds = KeybindConfig::default_preset();
         let mut include_japanese = false;
 
-        for p in &presets {
+        for p in presets {
             match *p {
                 "japanese" | "jp" => {
                     include_japanese = true;
@@ -1076,28 +1143,21 @@ impl Config {
                     keybinds = KeybindConfig::vim_preset();
                 }
                 _ => {
-                    // "default", "system", or unknown - use default keybinds
+                    // "default" or unknown - use default keybinds
                 }
             }
         }
 
-        // Generate preset name (exclude "system" from display)
-        let display_presets: Vec<&str> = presets
-            .iter()
-            .filter(|&&p| p != "system")
-            .copied()
-            .collect();
-        let preset_name = if display_presets.is_empty() {
+        let preset_name = if presets.is_empty() {
             "default".to_string()
         } else {
-            display_presets.join(" + ")
+            presets.join(" + ")
         };
 
-        // Config path for display in template
-        let config_path_display = if use_system_path {
-            "/etc/bcon/config.toml"
-        } else {
-            "~/.config/bcon/config.toml"
+        let config_path_display = match target {
+            WriteTarget::System => "/etc/bcon/config.toml".to_string(),
+            WriteTarget::User => "~/.config/bcon/config.toml".to_string(),
+            WriteTarget::Path(p) => p.display().to_string(),
         };
 
         // Serialize only keybinds (font settings use system defaults)
@@ -1325,20 +1385,19 @@ ime_disabled_apps = ["vim", "nvim", "vi", "vimdiff", "emacs", "nano", "less", "m
     /// Write default config to file
     #[allow(dead_code)]
     pub fn write_default_config() -> Result<PathBuf> {
-        Self::write_config_with_preset("default")
+        Self::write_config_with_preset(&WriteTarget::User, &[])
     }
 
-    /// Get config file path for given preset (without writing)
-    pub fn get_config_path_for_preset(preset: &str) -> Result<PathBuf> {
-        let presets: Vec<&str> = preset.split(',').map(|s| s.trim()).collect();
-        let use_system_path = presets.contains(&"system");
-
-        if use_system_path {
-            Ok(std::path::Path::new("/etc/bcon").join("config.toml"))
-        } else {
-            let config_dir =
-                dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Config directory not found"))?;
-            Ok(config_dir.join("bcon").join("config.toml"))
+    /// Get the config file path for a given write target (without writing).
+    pub fn path_for_target(target: &WriteTarget) -> Result<PathBuf> {
+        match target {
+            WriteTarget::System => Ok(std::path::Path::new("/etc/bcon").join("config.toml")),
+            WriteTarget::User => {
+                let config_dir = dirs::config_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Config directory not found"))?;
+                Ok(config_dir.join("bcon").join("config.toml"))
+            }
+            WriteTarget::Path(p) => Ok(p.clone()),
         }
     }
 }
@@ -1723,8 +1782,8 @@ lcd_weights = [10, 20, 30, 40, 50]
     }
 
     #[test]
-    fn test_load_three_layer_merge() {
-        // Three-layer merge: builtin defaults <- system layer <- user layer.
+    fn test_load_multi_layer_merge() {
+        // Multi-layer merge: builtin defaults <- system layer <- user layer.
         // The user layer must win on overlapping keys, while keys absent from
         // both files must fall back to Config::default() values transparently.
         use std::fs;
@@ -1863,5 +1922,88 @@ lcd_weights = [10, 20, 30, 40, 50]
             default.terminal.scrollback_lines
         );
         assert_eq!(parsed.keybinds.copy, default.keybinds.copy);
+    }
+
+    #[test]
+    fn test_parse_init_config_arg_cases() {
+        // Empty arg defaults to user with no presets (legacy bare --init-config).
+        assert_eq!(
+            parse_init_config_arg(""),
+            (WriteTarget::User, Vec::<String>::new())
+        );
+
+        // Legacy backward-compat: tokens without a recognized target keyword
+        // route to user (this is the form documented in README pre-Cycle 6).
+        assert_eq!(
+            parse_init_config_arg("vim,jp"),
+            (
+                WriteTarget::User,
+                vec!["vim".to_string(), "jp".to_string()]
+            )
+        );
+
+        // Explicit "system" target with no presets.
+        assert_eq!(
+            parse_init_config_arg("system"),
+            (WriteTarget::System, Vec::<String>::new())
+        );
+
+        // Explicit "system" target plus presets — backward compat with the
+        // original --init-config=system,vim,jp form.
+        assert_eq!(
+            parse_init_config_arg("system,vim,jp"),
+            (
+                WriteTarget::System,
+                vec!["vim".to_string(), "jp".to_string()]
+            )
+        );
+
+        // Explicit "user" token (Cycle 6 addition for unambiguous root use).
+        assert_eq!(
+            parse_init_config_arg("user,emacs"),
+            (WriteTarget::User, vec!["emacs".to_string()])
+        );
+
+        // Absolute path token.
+        assert_eq!(
+            parse_init_config_arg("/tmp/x.toml,vim"),
+            (
+                WriteTarget::Path(std::path::PathBuf::from("/tmp/x.toml")),
+                vec!["vim".to_string()]
+            )
+        );
+
+        // Path token without trailing presets.
+        assert_eq!(
+            parse_init_config_arg("/tmp/x.toml"),
+            (
+                WriteTarget::Path(std::path::PathBuf::from("/tmp/x.toml")),
+                Vec::<String>::new()
+            )
+        );
+
+        // Whitespace-tolerant tokens: parse_init_config_arg trims each split.
+        assert_eq!(
+            parse_init_config_arg(" system , vim , jp "),
+            (
+                WriteTarget::System,
+                vec!["vim".to_string(), "jp".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_expand_tilde_basics() {
+        // Bare absolute path passes through.
+        assert_eq!(
+            expand_tilde("/etc/bcon/config.toml"),
+            std::path::PathBuf::from("/etc/bcon/config.toml")
+        );
+
+        // ~/foo gets the home directory prepended (when one is detectable).
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde("~/.config/bcon/config.toml"),
+                       home.join(".config/bcon/config.toml"));
+        }
     }
 }

@@ -866,27 +866,48 @@ OPTIONS:
     -V, --version           Print version information
     -t, --test              Test mode (verify build without DRM)
     --backend=MODE          Backend selection: auto | seatd | vt
-    --init-config[=PRESET]  Generate config file with optional preset
+    --init-config[=ARG]     Generate config file (see below)
     -f, --force             Overwrite config file without confirmation
     --test-shaper           Test font shaping (debug mode)
 
-PRESETS (for --init-config):
-    default    Standard keybinds (Ctrl+Shift+C/V, etc.)
-    vim        Vim-like scroll (Ctrl+Shift+U/D)
-    emacs      Emacs-like scroll (Alt+Shift+V/N)
-    japanese   CJK fonts + IME auto-disable (alias: jp)
+CONFIG INITIALIZATION (--init-config):
+    Takes an optional comma-separated ARG. The first token, if it is
+    "system", "user", or a path starting with '/' or '~/', selects the
+    destination. Remaining tokens are preset names.
 
-    Combine presets with comma: --init-config=vim,jp
+    Targets:
+      user         ~/.config/bcon/config.toml (XDG, default when omitted)
+      system       /etc/bcon/config.toml (root required to write)
+      <abs path>   absolute path or '~/'-prefixed path
+
+    Presets (combine with comma):
+      default      Standard keybinds (Ctrl+Shift+C/V, etc.)
+      vim          Vim-like scroll (Ctrl+Shift+U/D)
+      emacs        Emacs-like scroll (Alt+Shift+V/N)
+      japanese     CJK fonts + IME auto-disable (alias: jp)
+
+ENV:
+    BCON_CONFIG    Absolute path to a single config file. When set and the
+                   file exists, bcon loads only that file (the layered
+                   /etc and ~/.config merge is bypassed). For debug/test.
 
 EXAMPLES:
-    bcon                              Run bcon (requires TTY, not X11/Wayland)
-    bcon --init-config                Generate default config
-    bcon --init-config=vim,jp         Generate config with vim and japanese presets
-    bcon --init-config=vim,jp --force Overwrite existing config
-    sudo bcon                         Run with root privileges (required for DRM)
+    bcon                                     Run bcon (requires TTY, not X/Wayland)
+    sudo bcon                                Run with root (required for DRM)
+    sudo bcon --init-config=system           Generate /etc/bcon/config.toml
+    sudo bcon --init-config=system,vim,jp    System config + vim + japanese
+    bcon --init-config=user                  Generate ~/.config/bcon/config.toml
+    bcon --init-config=user,vim,jp           User config + vim + japanese
+    bcon --init-config=/tmp/x.toml,vim       Arbitrary path (load via BCON_CONFIG)
+    bcon --init-config=~/foo.toml,vim        Tilde-expanded path (load via BCON_CONFIG)
+    bcon --init-config=user,vim --force      Overwrite existing config
 
-CONFIG FILE:
-    ~/.config/bcon/config.toml
+CONFIG FILES (layered XDG merge):
+    1. /etc/bcon/config.toml         (site default, package-installed)
+    2. ~/.config/bcon/config.toml    (user override, wins on overlapping keys)
+
+    Tables merge recursively; arrays and scalars replace wholesale.
+    Built-in defaults underlie both layers and fill any gaps.
 
 For more information, see: https://github.com/sanohiro/bcon
 "#,
@@ -1223,20 +1244,37 @@ fn main() -> Result<()> {
         backend_mode, is_root, seatd_available, use_seatd
     );
 
-    // Config file generation mode
-    // --init-config or --init-config=PRESET (default, emacs-like, vim-like)
+    // Config file generation mode.
+    // --init-config or --init-config=ARG, where ARG is a comma-separated list
+    // whose first token may be a target ("system", "user", or a path starting
+    // with '/' or '~/'); remaining tokens are preset names. The legacy form
+    // --init-config=vim,jp is preserved (target defaults to user).
     let init_config_arg = args.iter().find(|a| a.starts_with("--init-config"));
     if let Some(arg) = init_config_arg {
-        let preset = if arg.contains('=') {
-            arg.split('=').nth(1).unwrap_or("default")
+        let arg_value: &str = if arg.contains('=') {
+            arg.split_once('=').map(|(_, v)| v).unwrap_or("")
         } else {
-            "default"
+            ""
+        };
+
+        let (target, preset_owned) = config::parse_init_config_arg(arg_value);
+        let preset_strs: Vec<&str> = preset_owned.iter().map(|s| s.as_str()).collect();
+
+        let target_display = match &target {
+            config::WriteTarget::User => "user (~/.config/bcon/config.toml)".to_string(),
+            config::WriteTarget::System => "system (/etc/bcon/config.toml)".to_string(),
+            config::WriteTarget::Path(p) => format!("path ({})", p.display()),
+        };
+        let preset_display = if preset_strs.is_empty() {
+            "default".to_string()
+        } else {
+            preset_strs.join(",")
         };
 
         let force = args.iter().any(|a| a == "--force" || a == "-f");
 
-        // Check if config file already exists
-        if let Ok(config_path) = config::Config::get_config_path_for_preset(preset) {
+        // Check if config file already exists at the resolved target path.
+        if let Ok(config_path) = config::Config::path_for_target(&target) {
             if config_path.exists() && !force {
                 println!("Config file already exists: {}", config_path.display());
                 print!("Overwrite? [y/N]: ");
@@ -1270,24 +1308,23 @@ fn main() -> Result<()> {
             println!();
         }
 
-        match config::Config::write_config_with_preset(preset) {
+        match config::Config::write_config_with_preset(&target, &preset_strs) {
             Ok(path) => {
                 println!("Config file generated:");
-                println!("  Preset: {}", preset);
-                println!("  Path:   {}", path.display());
+                println!("  Target:  {target_display}");
+                println!("  Presets: {preset_display}");
+                println!("  Path:    {}", path.display());
                 if nerd_font_found {
                     println!("  Nerd Font: detected (symbols configured)");
                 }
                 println!();
-                println!("Available presets (combine with comma):");
-                println!("  default  - Standard keybinds (Ctrl+Shift+C/V, etc.)");
-                println!("  vim      - Vim-like scroll (Ctrl+Shift+U/D)");
-                println!("  emacs    - Emacs-like scroll (Alt+Shift+V/N)");
-                println!("  japanese - CJK fonts + IME auto-disable (alias: jp)");
+                println!("Usage forms (first comma-token decides target):");
+                println!("  sudo bcon --init-config=system           -> /etc/bcon/config.toml");
+                println!("  bcon --init-config=user,vim,jp           -> ~/.config/bcon/config.toml + vim + japanese");
+                println!("  bcon --init-config=/tmp/x.toml,vim       -> /tmp/x.toml + vim (load via BCON_CONFIG)");
+                println!("  bcon --init-config=~/foo.toml,vim        -> $HOME/foo.toml + vim (load via BCON_CONFIG)");
                 println!();
-                println!("Examples:");
-                println!("  bcon --init-config=vim,jp");
-                println!("  bcon --init-config=emacs,japanese");
+                println!("Available presets: default, vim, emacs, japanese (alias: jp)");
                 return Ok(());
             }
             Err(e) => {
