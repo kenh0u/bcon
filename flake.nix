@@ -52,10 +52,26 @@
     // {
       overlays.default =
         final: _prev:
+        let
+          # bcon launches fcitx5 itself; merge in the mozc engine addon so
+          # Japanese input works out of the box.
+          fcitx5-env = final.buildEnv {
+            name = "fcitx5-with-mozc";
+            paths = [
+              final.qt6Packages.fcitx5-with-addons
+              final.fcitx5-mozc
+            ];
+            pathsToLink = [
+              "/bin"
+              "/share/fcitx5"
+              "/lib/fcitx5"
+            ];
+          };
+        in
         {
           bcon = final.callPackage ./nix/package.nix {
             libseat = final.seatd;
-            fcitx5-with-addons = final.qt6Packages.fcitx5-with-addons;
+            fcitx5-with-addons = fcitx5-env;
           };
         };
 
