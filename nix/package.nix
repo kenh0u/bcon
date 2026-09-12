@@ -6,6 +6,7 @@
   # runtime-linked libraries
   libdrm,
   mesa,
+  libgbm,
   libGL,
   libxkbcommon,
   libinput,
@@ -24,7 +25,7 @@ let
   drvLibPath = lib.makeLibraryPath [
     libdrm
     mesa
-    mesa
+    libgbm
     libGL
     libxkbcommon
     libinput
@@ -46,7 +47,7 @@ rustPlatform.buildRustPackage {
   pname = "bcon";
   version = "1.4.0";
 
-  src = lib.cleanSource ./.;
+  src = lib.cleanSource ./..;
 
   cargoLock.lockFile = ../Cargo.lock;
 
@@ -68,6 +69,9 @@ rustPlatform.buildRustPackage {
     libseat
     wayland
   ];
+
+  # gbm-sys does not pick up the link search path from buildInputs.
+  env.NIX_LDFLAGS = "-L${libgbm}/lib";
 
   postFixup = ''
     wrapProgram $out/bin/bcon \

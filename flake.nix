@@ -35,6 +35,7 @@
             pkg-config
             libdrm
             mesa
+            libgbm
             libGL
             libxkbcommon
             libinput
