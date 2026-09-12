@@ -103,6 +103,8 @@ in
 
       environment = {
         BCON_BACKEND = cfg.backend;
+        # NixOS has no /bin/login.
+        BCON_LOGIN = toString (pkgs.util-linux.login or pkgs.util-linux) + "/bin/login";
         RUST_LOG = "info";
       };
 

@@ -202,7 +202,11 @@ impl Pty {
                     // Disable login timeout — bcon acts as a getty replacement,
                     // so the login prompt should persist indefinitely.
                     std::env::set_var("LOGIN_TIMEOUT", "0");
-                    let login = match std::ffi::CString::new("/bin/login") {
+                    // BCON_LOGIN overrides the login binary path (e.g. NixOS,
+                    // where /bin/login does not exist).
+                    let login = match std::ffi::CString::new(
+                        std::env::var("BCON_LOGIN").unwrap_or_else(|_| "/bin/login".to_string()),
+                    ) {
                         Ok(s) => s,
                         Err(_) => std::process::exit(1),
                     };
