@@ -524,7 +524,7 @@ impl VtSwitcher {
         // VT_WAITACTIVE can be uninterruptible when signals are handled with SA_RESTART.
         // Timeout after 10 seconds to prevent indefinite blocking.
         info!("Waiting for VT{} to become active...", target_vt);
-        let vt_wait_start = std::time::Instant::now();
+        let mut vt_wait_start = std::time::Instant::now();
         const VT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
         let vt_wait_success = loop {
             if shutdown_requested() {
@@ -534,13 +534,16 @@ impl VtSwitcher {
                 );
                 break false;
             }
+            // The VT is normally inactive until the user switches to it
+            // (Ctrl+Alt+F{n}), which may be hours after boot — like getty,
+            // keep waiting instead of failing and restart-looping.
             if vt_wait_start.elapsed() >= VT_WAIT_TIMEOUT {
                 warn!(
-                    "Timed out waiting for VT{} to become active ({}s)",
+                    "VT{} still inactive ({}s), waiting for a VT switch",
                     target_vt,
-                    VT_WAIT_TIMEOUT.as_secs()
+                    vt_wait_start.elapsed().as_secs()
                 );
-                break false;
+                vt_wait_start = std::time::Instant::now();
             }
             #[repr(C)]
             struct VtStat {
