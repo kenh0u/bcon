@@ -104,7 +104,9 @@ in
       environment = {
         BCON_BACKEND = cfg.backend;
         # NixOS has no /bin/login.
-        BCON_LOGIN = toString (pkgs.util-linux.login or pkgs.util-linux) + "/bin/login";
+        # NixOS has no /bin/login; its PAM-enabled login comes from shadow
+        # (util-linux's "login" attr evaluates to a nonexistent path).
+        BCON_LOGIN = lib.getExe' pkgs.shadow "login";
         RUST_LOG = "info";
       };
 
